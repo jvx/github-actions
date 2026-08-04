@@ -28,6 +28,9 @@ Caller repositories keep their own secrets, target directories, and repo-specifi
   summary artifacts.
 - [Rsync deploy](docs/rsync-deploy.md): a reusable real deploy workflow that
   uploads via rsync without `--delete` and writes a bounded deploy report.
+- [Immutable Next.js user-systemd deploy](docs/nextjs-systemd-deploy.md): a
+  reusable release-directory deployment with shared state, atomic activation,
+  bounded health checks, and database-aware rollback.
 
 ## Safety model
 

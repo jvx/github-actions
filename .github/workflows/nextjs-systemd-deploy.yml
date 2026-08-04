@@ -1,0 +1,270 @@
+name: Reusable Next.js user-systemd deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment_name:
+        description: GitHub environment used for approvals and caller secrets.
+        required: true
+        type: string
+      toolkit_repository:
+        description: Repository containing this workflow's deployment script.
+        required: true
+        type: string
+      toolkit_ref:
+        description: Immutable commit or tag containing this workflow's deployment script.
+        required: true
+        type: string
+      systemd_service:
+        description: Name of the preconfigured user systemd service.
+        required: true
+        type: string
+      node_bin_dir:
+        description: Absolute remote directory containing the desired Node.js binaries.
+        required: true
+        type: string
+      install_command:
+        description: Shell command that installs dependencies in the new release.
+        required: true
+        type: string
+      build_command:
+        description: Shell command that builds the new release.
+        required: true
+        type: string
+      migration_command:
+        description: Shell command that migrates the shared database after service stop.
+        required: true
+        type: string
+      shared_env_name:
+        description: Relative filename under the remote shared directory.
+        required: true
+        type: string
+      shared_env_path:
+        description: Release-relative path at which to link the shared environment file.
+        required: true
+        type: string
+      database_relative_path:
+        description: Release-relative path at which to link the shared database.
+        required: true
+        type: string
+      shared_database_name:
+        description: Shared database filename.
+        required: true
+        type: string
+      shared_database_path:
+        description: Relative directory under shared containing the database.
+        required: false
+        type: string
+        default: "."
+      local_healthcheck_url:
+        description: Loopback HTTP(S) health endpoint checked on the deployment host.
+        required: true
+        type: string
+      public_healthcheck_url:
+        description: Public HTTP(S) health endpoint checked on the deployment host.
+        required: true
+        type: string
+      health_timeout_seconds:
+        description: Maximum seconds allowed for each health endpoint.
+        required: false
+        type: number
+        default: 60
+      releases_to_keep:
+        description: Number of releases to retain, including current and previous (minimum 2).
+        required: false
+        type: number
+        default: 3
+      ssh_port:
+        description: SSH port.
+        required: false
+        type: number
+        default: 22
+      artifact_retention_days:
+        description: Number of days to retain the sanitized deployment report.
+        required: false
+        type: number
+        default: 7
+    secrets:
+      ssh_private_key:
+        description: SSH private key for the deployment user.
+        required: true
+      known_hosts:
+        description: Known-hosts content used for strict host verification.
+        required: true
+      remote_host:
+        description: Deployment host.
+        required: true
+      remote_user:
+        description: Deployment user that owns the user systemd service.
+        required: true
+      remote_app_root:
+        description: Pre-bootstrapped remote application root.
+        required: true
+      ssh_passphrase:
+        description: Optional passphrase for the SSH private key.
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nextjs-systemd-${{ github.repository }}-${{ inputs.environment_name }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Immutable release deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: ${{ inputs.environment_name }}
+    steps:
+      - name: Check out caller repository
+        uses: actions/checkout@v6
+        with:
+          path: caller
+          fetch-depth: 1
+
+      - name: Check out workflow implementation
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.toolkit_repository }}
+          ref: ${{ inputs.toolkit_ref }}
+          path: workflow-library
+          persist-credentials: false
+
+      - name: Configure strict SSH
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.ssh_private_key }}
+          SSH_PASSPHRASE: ${{ secrets.ssh_passphrase }}
+          KNOWN_HOSTS: ${{ secrets.known_hosts }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "${SSH_PRIVATE_KEY}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "${KNOWN_HOSTS}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          if [[ -n "${SSH_PASSPHRASE}" ]]; then
+            eval "$(ssh-agent -s)"
+            askpass="${RUNNER_TEMP}/ssh-askpass.sh"
+            printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$SSH_PASSPHRASE"\n' > "${askpass}"
+            chmod 700 "${askpass}"
+            DISPLAY=:0 SSH_ASKPASS="${askpass}" SSH_ASKPASS_REQUIRE=force ssh-add ~/.ssh/deploy_key </dev/null
+          fi
+
+      - name: Upload tracked content and deploy
+        id: deployment
+        continue-on-error: true
+        shell: bash
+        env:
+          REMOTE_HOST: ${{ secrets.remote_host }}
+          REMOTE_USER: ${{ secrets.remote_user }}
+          APP_ROOT: ${{ secrets.remote_app_root }}
+          SSH_PORT: ${{ inputs.ssh_port }}
+          SYSTEMD_SERVICE: ${{ inputs.systemd_service }}
+          NODE_BIN_DIR: ${{ inputs.node_bin_dir }}
+          INSTALL_COMMAND: ${{ inputs.install_command }}
+          BUILD_COMMAND: ${{ inputs.build_command }}
+          MIGRATION_COMMAND: ${{ inputs.migration_command }}
+          SHARED_ENV_NAME: ${{ inputs.shared_env_name }}
+          SHARED_ENV_PATH: ${{ inputs.shared_env_path }}
+          DATABASE_RELATIVE_PATH: ${{ inputs.database_relative_path }}
+          SHARED_DATABASE_NAME: ${{ inputs.shared_database_name }}
+          SHARED_DATABASE_PATH: ${{ inputs.shared_database_path }}
+          LOCAL_HEALTHCHECK_URL: ${{ inputs.local_healthcheck_url }}
+          PUBLIC_HEALTHCHECK_URL: ${{ inputs.public_healthcheck_url }}
+          HEALTH_TIMEOUT_SECONDS: ${{ inputs.health_timeout_seconds }}
+          RELEASES_TO_KEEP: ${{ inputs.releases_to_keep }}
+        run: |
+          set -Eeuo pipefail
+          release_id="run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_SHA:0:12}"
+          [[ "${release_id}" =~ ^[A-Za-z0-9._-]+$ ]]
+          remote_release="${APP_ROOT%/}/releases/${release_id}"
+          remote_temp=".nextjs-deploy-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          ssh_args=(-i ~/.ssh/deploy_key -p "${SSH_PORT}" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15)
+          scp_args=(-i ~/.ssh/deploy_key -P "${SSH_PORT}" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15)
+          target="${REMOTE_USER}@${REMOTE_HOST}"
+          app_root_q=$(printf '%q' "${APP_ROOT%/}")
+          release_q=$(printf '%q' "${remote_release}")
+          temp_q=$(printf '%q' "${remote_temp}")
+
+          ssh "${ssh_args[@]}" "${target}" "app_root=${app_root_q} release=${release_q} bash -s" <<'REMOTE'
+          set -euo pipefail
+          [[ "$app_root" == /* && "$app_root" != / ]]
+          [[ -d "$app_root/shared" && -d "$app_root/releases" && -L "$app_root/current" ]]
+          [[ "$release" == "$app_root/releases/"* && ! -e "$release" ]]
+          install -d -m 755 "$release"
+          REMOTE
+
+          (cd caller && git ls-files --cached -z | tar --no-recursion --null --files-from=- -czf -) |
+            ssh "${ssh_args[@]}" "${target}" "tar -xzf - -C ${release_q}"
+
+          config="${RUNNER_TEMP}/nextjs-deploy.config"
+          : > "${config}"
+          add_config() { printf '%s=%s\n' "$1" "$(printf '%s' "$2" | base64 -w 0)" >> "${config}"; }
+          add_config DEPLOY_APP_ROOT "${APP_ROOT%/}"
+          add_config DEPLOY_RELEASE "${remote_release}"
+          add_config DEPLOY_SYSTEMD_SERVICE "${SYSTEMD_SERVICE}"
+          add_config DEPLOY_NODE_BIN_DIR "${NODE_BIN_DIR}"
+          add_config DEPLOY_INSTALL_COMMAND "${INSTALL_COMMAND}"
+          add_config DEPLOY_BUILD_COMMAND "${BUILD_COMMAND}"
+          add_config DEPLOY_MIGRATION_COMMAND "${MIGRATION_COMMAND}"
+          add_config DEPLOY_SHARED_ENV_NAME "${SHARED_ENV_NAME}"
+          add_config DEPLOY_SHARED_ENV_PATH "${SHARED_ENV_PATH}"
+          add_config DEPLOY_DATABASE_RELATIVE_PATH "${DATABASE_RELATIVE_PATH}"
+          add_config DEPLOY_SHARED_DATABASE_NAME "${SHARED_DATABASE_NAME}"
+          add_config DEPLOY_SHARED_DATABASE_PATH "${SHARED_DATABASE_PATH}"
+          add_config DEPLOY_LOCAL_HEALTHCHECK_URL "${LOCAL_HEALTHCHECK_URL}"
+          add_config DEPLOY_PUBLIC_HEALTHCHECK_URL "${PUBLIC_HEALTHCHECK_URL}"
+          add_config DEPLOY_HEALTH_TIMEOUT_SECONDS "${HEALTH_TIMEOUT_SECONDS}"
+          add_config DEPLOY_RELEASES_TO_KEEP "${RELEASES_TO_KEEP}"
+          chmod 600 "${config}"
+
+          ssh "${ssh_args[@]}" "${target}" "install -d -m 700 ${temp_q}"
+          scp "${scp_args[@]}" "${config}" workflow-library/scripts/nextjs_systemd_deploy.sh \
+            "${target}:${remote_temp}/"
+          ssh "${ssh_args[@]}" "${target}" "temp=${temp_q} bash -s" <<'REMOTE'
+          set -Eeuo pipefail
+          chmod 700 "$temp/nextjs_systemd_deploy.sh"
+          cleanup() { rm -rf -- "$temp"; }
+          trap cleanup EXIT
+          while IFS='=' read -r key encoded; do
+            [[ "$key" =~ ^DEPLOY_[A-Z0-9_]+$ ]]
+            value=$(printf '%s' "$encoded" | base64 --decode)
+            export "$key=$value"
+          done < "$temp/nextjs-deploy.config"
+          "$temp/nextjs_systemd_deploy.sh"
+          REMOTE
+
+      - name: Write sanitized deployment report
+        if: always()
+        shell: bash
+        env:
+          DEPLOY_OUTCOME: ${{ steps.deployment.outcome }}
+        run: |
+          set -euo pipefail
+          mkdir -p deployment-report
+          if [[ "${DEPLOY_OUTCOME}" == success ]]; then status=succeeded; else status=failed; fi
+          printf 'Immutable release deployment: %s\n' "${status}" > deployment-report/result.txt
+          {
+            echo "# Immutable Release Deployment"
+            echo
+            echo "- result: \`${status}\`"
+            echo "- report: sanitized; host, user, application paths, commands, and endpoint values omitted"
+            echo "- rollback policy: restore prior release and database after any post-stop failure"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload sanitized deployment report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: nextjs-systemd-deploy-report
+          path: deployment-report/result.txt
+          retention-days: ${{ inputs.artifact_retention_days }}
+          if-no-files-found: error
+
+      - name: Propagate deployment failure
+        if: steps.deployment.outcome != 'success'
+        shell: bash
+        run: exit 1
