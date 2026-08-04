@@ -1,0 +1,28 @@
+name: Verify Next.js systemd deploy
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/nextjs-systemd-deploy.yml
+      - .github/workflows/test-nextjs-systemd-deploy.yml
+      - scripts/nextjs_systemd_deploy.sh
+      - tests/nextjs_systemd_deploy_test.sh
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fixtures:
+    name: Deployment fixtures
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Validate shell syntax
+        run: bash -n scripts/nextjs_systemd_deploy.sh tests/nextjs_systemd_deploy_test.sh
+
+      - name: Run deployment fixtures
+        run: bash tests/nextjs_systemd_deploy_test.sh
